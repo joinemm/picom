@@ -558,6 +558,14 @@ static void configure_root(session_t *ps) {
 	ps->root_width = r->width;
 	ps->root_height = r->height;
 
+	auto prop = x_get_prop(ps->c, ps->root, ps->atoms->a_NET_CURRENT_DESKTOP,
+					1L, XCB_ATOM_CARDINAL, 32);
+
+	ps->root_desktop_switch_direction = 0;
+	if (prop.nitems) {
+		ps->root_desktop_num = (int)*prop.c32;
+	}
+
 	rebuild_screen_reg(ps);
 	rebuild_shadow_exclude_reg(ps);
 
@@ -640,10 +648,17 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 	}
 	ps->fade_time += steps * ps->o.fade_delta;
 
-	if (ps->o.animations && !ps->animation_time)
-		ps->animation_time = now;
+	double animation_delta = 0;
+	if (ps->o.animations) {
+		if (!ps->animation_time)
+			ps->animation_time = now;
 
-	double delta_secs = (double)(now - ps->animation_time) / 1000;
+		animation_delta = (double)(now - ps->animation_time) /
+			(ps->o.animation_delta*100);
+
+		if (ps->o.animation_force_steps)
+			animation_delta = min2(animation_delta, ps->o.animation_delta/1000);
+	}
 
 	// First, let's process fading
 	win_stack_foreach_managed_safe(w, &ps->window_stack) {
@@ -653,7 +668,7 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 
 		// IMPORTANT: These window animation steps must happen before any other
 		// [pre]processing. This is because it changes the window's geometry.
-		if (ps->o.animations && 
+		if (ps->o.animations &&
 			!isnan(w->animation_progress) && w->animation_progress != 1.0 &&
 			ps->o.wintype_option[w->window_type].animation != 0 &&
 			win_is_mapped_in_x(w))
@@ -680,20 +695,20 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 				(ps->o.animation_stiffness * neg_displacement_h -
 					ps->o.animation_dampening * w->animation_velocity_h) /
 				ps->o.animation_window_mass;
-			w->animation_velocity_x += acceleration_x * delta_secs;
-			w->animation_velocity_y += acceleration_y * delta_secs;
-			w->animation_velocity_w += acceleration_w * delta_secs;
-			w->animation_velocity_h += acceleration_h * delta_secs;
+			w->animation_velocity_x += acceleration_x * animation_delta;
+			w->animation_velocity_y += acceleration_y * animation_delta;
+			w->animation_velocity_w += acceleration_w * animation_delta;
+			w->animation_velocity_h += acceleration_h * animation_delta;
 
 			// Animate window geometry
 			double new_animation_x =
-				w->animation_center_x + w->animation_velocity_x * delta_secs;
+				w->animation_center_x + w->animation_velocity_x * animation_delta;
 			double new_animation_y =
-				w->animation_center_y + w->animation_velocity_y * delta_secs;
+				w->animation_center_y + w->animation_velocity_y * animation_delta;
 			double new_animation_w =
-				w->animation_w + w->animation_velocity_w * delta_secs;
+				w->animation_w + w->animation_velocity_w * animation_delta;
 			double new_animation_h =
-				w->animation_h + w->animation_velocity_h * delta_secs;
+				w->animation_h + w->animation_velocity_h * animation_delta;
 
 			// Negative new width/height causes segfault and it can happen
 			// when clamping disabled and shading a window
@@ -775,7 +790,9 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 				pixman_region32_init_rect(&w->bounding_shape, 0, 0,
 				                          (uint)w->widthb, (uint)w->heightb);
 
-				win_clear_flags(w, WIN_FLAGS_PIXMAP_STALE);
+				if (w->state != WSTATE_DESTROYING)
+					win_clear_flags(w, WIN_FLAGS_PIXMAP_STALE);
+
 				win_process_image_flags(ps, w);
 			}
 			// Mark new window region with damage
@@ -792,6 +809,27 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 				w->animation_velocity_y = 0.0;
 				w->animation_velocity_w = 0.0;
 				w->animation_velocity_h = 0.0;
+			}
+
+			if (!ps->root_desktop_switch_direction) {
+				if (w->state == WSTATE_UNMAPPING || w->state == WSTATE_DESTROYING) {
+					steps = 0;
+					double new_opacity = clamp(
+									w->opacity_target_old-w->animation_progress,
+									w->opacity_target, 1);
+
+					if (new_opacity < w->opacity)
+						w->opacity = new_opacity;
+
+				} else if (w->state == WSTATE_MAPPING) {
+					steps = 0;
+					double new_opacity = clamp(
+										w->animation_progress,
+										0.0, w->opacity_target);
+
+					if (new_opacity > w->opacity)
+						w->opacity = new_opacity;
+				}
 			}
 
 			*animation_running = true;
@@ -838,7 +876,7 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 		}
 	}
 
-	if (animation_running)
+	if (*animation_running)
 		ps->animation_time = now;
 
 	// Opacity will not change, from now on.
@@ -867,7 +905,10 @@ paint_preprocess(session_t *ps, bool *fade_running, bool *animation_running) {
 		if (w->state == WSTATE_UNMAPPED ||
 		    unlikely(w->base.id == ps->debug_window ||
 		             w->client_win == ps->debug_window)) {
-			to_paint = false;
+
+			if (!*fade_running || w->opacity == w->opacity_target)
+				to_paint = false;
+
 		} else if (!w->ever_damaged && w->state != WSTATE_UNMAPPING &&
 		           w->state != WSTATE_DESTROYING) {
 			// Unmapping clears w->ever_damaged, but the fact that the window
@@ -1652,6 +1693,7 @@ static void draw_callback_impl(EV_P_ session_t *ps, int revents attr_unused) {
 	}
 	if (!animation_running) {
 		ps->animation_time = 0L;
+		ps->root_desktop_switch_direction = 0;
 	}
 
 	// TODO(yshui) Investigate how big the X critical section needs to be. There are
